@@ -70,4 +70,6 @@ void textc_fill_index_buffer(uint16_t* buffer, size_t count) {
         buffer[i + 5] = v + 0;
     }
 }
+
+// in other words, it's always bunch of quads one after the other
 ```

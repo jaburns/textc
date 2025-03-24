@@ -6,5 +6,4 @@ UseTab: Never
 DerivePointerAlignment: false
 SortIncludes: false
 PointerAlignment: Left
-AttributeMacros: [ARRAY, ENTITY_CALL]
 AlignAfterOpenBracket: BlockIndent

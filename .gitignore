@@ -3,6 +3,3 @@
 /vcpkg/
 /output/
 /bin/
-*.png
-*.bin
-atlas.h

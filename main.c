@@ -1,14 +1,12 @@
-// -----------------------------------------------------------------------------
-
-#include <stddef.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <ctype.h>
-#include <string.h>
-#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
-
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 #include <glib.h>
@@ -20,29 +18,19 @@
 // -----------------------------------------------------------------------------
 // flags
 
-#define ENABLE_DEBUG_OUTPUT
-// #define ENABLE_DEBUG_GLYPH_BOUNDS
-
-// -----------------------------------------------------------------------------
-// consts
-
-static const uint32_t HEADER_MAGIC = 0x00545854;               // TXTv (high byte is version)
-static const uint32_t HEADER_VERTEX_SIZE = 4 * sizeof(float);  // x, y, u, v
-static const uint32_t HEADER_INDEX_SIZE = sizeof(uint16_t);
-
-#define STRINGS_CSV_PARAM_ENTRIES 3
-#define MAX_CSV_COLUMNS 65536
+#define ENABLE_DEBUG_OUTPUT 1
+#define ENABLE_DEBUG_GLYPH_BOUNDS 0
 
 // -----------------------------------------------------------------------------
 
+#define Assert g_assert
 #define Panic(...)                    \
     do {                              \
         fprintf(stderr, __VA_ARGS__); \
         fprintf(stderr, "\n");        \
+        raise(SIGTRAP);               \
         exit(1);                      \
     } while (0)
-
-#define Assert g_assert
 
 // -----------------------------------------------------------------------------
 // memory
@@ -112,9 +100,6 @@ static void arena_clear(Arena* arena) {
     arena->tail = arena->head;
     arena_resize(arena, 0);
 }
-
-#define ScratchAcquire(size) calloc(1, size)
-#define ScratchRelease(ptr) free(ptr)
 
 #define ArenaOf(_t) Arena
 #define ArenaPushT(type, arena_ptr) ((type*)arena_alloc((arena_ptr), sizeof(type)))
@@ -232,9 +217,7 @@ static void parse_csv(
     void (*on_header)(Arena* arena, InputCsv* ctx, char** items, uint32_t item_count),
     void (*on_row)(Arena* arena, InputCsv* ctx, char** items, uint32_t item_count)
 ) {
-    char** items = ScratchAcquire(MAX_CSV_COLUMNS * sizeof(char*));
-    uint32_t item_count = 0;
-
+    ArenaOf(char*) items = arena_create();
     bool inside_quotes = false;
     bool done_header = false;
     char* cursor = file_contents;
@@ -258,19 +241,19 @@ static void parse_csv(
             inside_quotes = true;
         } else if (c == ',' || c == '\n' || c == '\0') {
             *tail++ = '\0';
-            items[item_count++] = head;
-            Assert(item_count < MAX_CSV_COLUMNS);
+            *ArenaPushT(char*, &items) = head;
             head = tail;
             if (c != ',') {
-                if (*items[0] != '\0' && item_count > 1) {
+                uint32_t item_count = ArenaCountT(char*, &items);
+                if (**ArenaGetT(char*, &items, 0) != '\0' && item_count > 1) {
                     if (done_header) {
-                        on_row(arena, ctx, items, item_count);
+                        on_row(arena, ctx, (char**)items.head, item_count);
                     } else if (on_header) {
-                        on_header(arena, ctx, items, item_count);
+                        on_header(arena, ctx, (char**)items.head, item_count);
                     }
                     done_header = true;
                 }
-                item_count = 0;
+                arena_clear(&items);
             }
             if (c == '\0') break;
         } else {
@@ -279,7 +262,7 @@ static void parse_csv(
         cursor++;
     }
 
-    ScratchRelease(items);
+    arena_destroy(&items);
 }
 
 static void parse_styles_csv_row(Arena* arena, InputCsv* input, char** items, uint32_t item_count) {
@@ -290,6 +273,8 @@ static void parse_styles_csv_row(Arena* arena, InputCsv* input, char** items, ui
     entry->style.size = atoi(items[2]);
     entry->style.lineheight = atof(items[3]);
 }
+
+#define STRINGS_CSV_PARAM_ENTRIES 3
 
 static void parse_strings_csv_header(Arena* arena, InputCsv* input, char** items, uint32_t item_count) {
     Assert(item_count > STRINGS_CSV_PARAM_ENTRIES);
@@ -435,7 +420,6 @@ typedef struct {
 
 typedef struct {
     float x0, y0, x1, y1;
-    bool right_to_left;
     uint32_t used_glyph_idx;
     uint32_t source_idx;
 } TypesetGlyph;
@@ -445,7 +429,6 @@ typedef struct _ShimRenderer {
 
     LoadedFonts* loaded_fonts;
 
-    bool cur_right_to_left;
     char* cur_face;
     uint32_t cur_source_offset;
 
@@ -457,12 +440,10 @@ typedef struct _ShimRendererClass {
     PangoRendererClass parent_class;
 } ShimRendererClass;
 
-#define SHIM_TYPE_RENDERER (shim_renderer_get_type())
 G_DEFINE_TYPE(ShimRenderer, shim_renderer, PANGO_TYPE_RENDERER)
 
 static void shim_renderer_prepare_run(PangoRenderer* renderer0, PangoLayoutRun* run) {
     ShimRenderer* renderer = (ShimRenderer*)renderer0;
-    renderer->cur_right_to_left = run->item->analysis.level % 2;
     renderer->cur_source_offset = run->item->offset;
 
     PangoFontDescription* font_desc = pango_font_describe(run->item->analysis.font);
@@ -511,7 +492,6 @@ static void shim_renderer_draw_glyphs(PangoRenderer* renderer0, PangoFont* font,
             *ArenaPushT(TypesetGlyph, &renderer->typeset_glyphs) = (TypesetGlyph){
                 .used_glyph_idx = used_glyph_idx,
                 .source_idx = glyphs->log_clusters[i] + renderer->cur_source_offset,
-                .right_to_left = renderer->cur_right_to_left,
                 .x0 = (float)(cx + (double)ink_extents.x / (double)PANGO_SCALE),
                 .y0 = (float)(cy + (double)ink_extents.y / (double)PANGO_SCALE),
                 .x1 = (float)(cx + (double)ink_extents.x / (double)PANGO_SCALE + (double)ink_extents.width / (double)PANGO_SCALE),
@@ -531,7 +511,7 @@ static void shim_renderer_class_init(ShimRendererClass* klass) {
 }
 
 static ShimRenderer* shim_renderer_new(LoadedFonts* loaded_fonts) {
-    ShimRenderer* ret = g_object_new(SHIM_TYPE_RENDERER, NULL);
+    ShimRenderer* ret = g_object_new(shim_renderer_get_type(), NULL);
     ret->loaded_fonts = loaded_fonts;
     ret->typeset_glyphs = arena_create();
     ret->used_glyphs = arena_create();
@@ -565,12 +545,13 @@ static ShimRenderer* shim_renderer_new(LoadedFonts* loaded_fonts) {
 // }
 
 static void bake_used_glyphs_to_atlas(ShimRenderer* renderer) {
+    static char command[1024];
+
     FILE* atlas_h = fopen("output/atlas.h", "w");
     uint32_t atlas_dim = 1024;
 
-    char* command = ScratchAcquire(1024);
-    uint8_t* atlas = ScratchAcquire(atlas_dim * atlas_dim * 4);
     Arena scratch = arena_create();
+    uint8_t* atlas = arena_alloc(&scratch, atlas_dim * atlas_dim * 4);
 
     int32_t basex = 0;
     int32_t basey = 0;
@@ -631,8 +612,6 @@ static void bake_used_glyphs_to_atlas(ShimRenderer* renderer) {
     if (error) Panic("Error saving PNG: %s\n", lodepng_error_text(error));
     fclose(atlas_h);
 
-    ScratchRelease(atlas);
-    ScratchRelease(command);
     arena_destroy(&scratch);
 }
 
@@ -675,12 +654,14 @@ static RenderedPage render_page(
     uint32_t width,
     uint32_t height,
     char* contents,
+    uint32_t contents_len,
     UserTag* user_tags,
     uint32_t user_tag_count
 ) {
     char filename_buffer[256];
-
     arena_clear(&renderer->typeset_glyphs);
+
+    Arena scratch = arena_create();
 
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     cairo_t* cr = cairo_create(surface);
@@ -689,14 +670,40 @@ static RenderedPage render_page(
     pango_layout_set_width(layout, width * PANGO_SCALE);
     pango_layout_set_height(layout, height * PANGO_SCALE);
     pango_layout_set_text(layout, contents, -1);
-
     pango_layout_set_attributes(layout, attr_list);
-
     pango_renderer_draw_layout((PangoRenderer*)renderer, layout, 0, 0);
 
-    qsort((TypesetGlyph*)renderer->typeset_glyphs.head, ArenaCountT(TypesetGlyph, &renderer->typeset_glyphs), sizeof(TypesetGlyph), typeset_glyph_sort_ascending_source_idx);
+    TypesetGlyph* glyphs = (TypesetGlyph*)renderer->typeset_glyphs.head;
+    uint32_t glyph_count = ArenaCountT(TypesetGlyph, &renderer->typeset_glyphs);
 
-#ifdef ENABLE_DEBUG_OUTPUT
+    // sort glyphs into order the appear in the text instead of being always left-to-right
+
+    qsort(glyphs, glyph_count, sizeof(TypesetGlyph), typeset_glyph_sort_ascending_source_idx);
+
+    // convert source string indices in user tags to glyph array indices
+
+    uint32_t* index_map = arena_alloc(&scratch, sizeof(uint32_t) * contents_len);
+    memset(index_map, 0xFF, sizeof(uint32_t) * contents_len);
+
+    for (uint32_t i = 0; i < glyph_count; ++i) {
+        index_map[glyphs[i].source_idx] = i;
+    }
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < contents_len; ++i) {
+        if (index_map[i] == UINT32_MAX) {
+            index_map[i] = prev;
+        } else {
+            prev = index_map[i];
+        }
+    }
+    for (uint32_t i = 0; i < user_tag_count; ++i) {
+        user_tags[i].start_idx = index_map[user_tags[i].start_idx];
+        user_tags[i].end_idx = index_map[user_tags[i].end_idx];
+    }
+
+    // ---
+
+#if ENABLE_DEBUG_OUTPUT
     {
         cairo_set_source_rgb(cr, 1, 1, 1);
         pango_cairo_show_layout(cr, layout);
@@ -705,7 +712,7 @@ static RenderedPage render_page(
         int32_t stride = cairo_image_surface_get_stride(surface);
         int32_t width = cairo_image_surface_get_width(surface);
         int32_t height = cairo_image_surface_get_height(surface);
-        unsigned char* png_data = ScratchAcquire(width * height * 4);
+        unsigned char* png_data = arena_alloc(&scratch, width * height * 4);
         for (int32_t y = 0; y < height; y++) {
             for (int32_t x = 0; x < width; x++) {
                 unsigned char* src_pixel = data + y * stride + x * 4;
@@ -717,7 +724,7 @@ static RenderedPage render_page(
             }
         }
 
-#ifdef ENABLE_DEBUG_GLYPH_BOUNDS
+#if ENABLE_DEBUG_GLYPH_BOUNDS
         for (int32_t i = 0; i < renderer->typeset_glyph_count; ++i) {
             TypesetGlyph* glyph = &renderer->typeset_glyphs[i];
 
@@ -746,8 +753,6 @@ static RenderedPage render_page(
         snprintf(filename_buffer, 256, "output/%s.%u.png", strings_table_key, page_number);
         unsigned error = lodepng_encode32_file(filename_buffer, png_data, width, height);
         if (error) Panic("Error saving PNG: %s\n", lodepng_error_text(error));
-
-        ScratchRelease(png_data);
     }
 #endif  // ENABLE_DEBUG_OUTPUT
 
@@ -763,6 +768,8 @@ static RenderedPage render_page(
     };
     memcpy(ret.typeset_glyphs, renderer->typeset_glyphs.head, ret.typeset_glyph_count * sizeof(TypesetGlyph));
     memcpy(ret.user_tags, user_tags, user_tag_count * sizeof(UserTag));
+
+    arena_destroy(&scratch);
     return ret;
 }
 
@@ -796,8 +803,9 @@ static RenderedString render_string_entry(
     uint32_t string_idx
 ) {
     RenderedString ret = {0};
+    Arena scratch = arena_create();
 
-    char* page_buffer = ScratchAcquire(input->max_string_length);
+    char* page_buffer = arena_alloc(&scratch, input->max_string_length);
     ArenaOf(TextStyle*) style_history = arena_create();
     ArenaOf(UserTag) user_tag_stack = arena_create();
     ArenaOf(UserTag) user_tags = arena_create();
@@ -861,7 +869,7 @@ static RenderedString render_string_entry(
 
                 *page_write = 0;
                 *ArenaPushT(RenderedPage, &pages_acc) = render_page(
-                    arena, pango_context, renderer, attr_list, string->key, ret.page_count++, string->width, string->height, page_buffer,
+                    arena, pango_context, renderer, attr_list, string->key, ret.page_count++, string->width, string->height, page_buffer, page_write - page_buffer,
                     (UserTag*)user_tags.head, ArenaCountT(UserTag, &user_tags)
                 );
                 page_write = page_buffer;
@@ -896,7 +904,7 @@ static RenderedString render_string_entry(
 
     *page_write = 0;
     *ArenaPushT(RenderedPage, &pages_acc) = render_page(
-        arena, pango_context, renderer, attr_list, string->key, ret.page_count++, string->width, string->height, page_buffer,
+        arena, pango_context, renderer, attr_list, string->key, ret.page_count++, string->width, string->height, page_buffer, page_write - page_buffer,
         (UserTag*)user_tags.head, ArenaCountT(UserTag, &user_tags)
     );
     pango_attr_list_unref(attr_list);
@@ -904,7 +912,7 @@ static RenderedString render_string_entry(
     ret.pages = arena_alloc(arena, ret.page_count * sizeof(RenderedPage));
     memcpy(ret.pages, pages_acc.head, ret.page_count * sizeof(RenderedPage));
 
-    ScratchRelease(page_buffer);
+    arena_destroy(&scratch);
     arena_destroy(&style_history);
     arena_destroy(&user_tag_stack);
     arena_destroy(&user_tags);
@@ -952,11 +960,14 @@ int main(int argc, char** argv) {
 
     // TODO
     // - get the atlas results into a struct and use it to iterate over the results and create uvs while writing the output file
-    //  - translate start/end indices in user tags list
-    //  - cache atlas, don't bake it if no new glyphs were added or removed by changing the text.
-    //  - pack atlas properly, selecting correct minimumish size
+    // - cache atlas, don't bake it if no new glyphs were added or removed by changing the text.
+    // - pack atlas properly, selecting correct minimumish size
 
     FILE* file = fopen("output/strings.txtc", "wb+");
+
+    static const uint32_t HEADER_MAGIC = 0x00545854;               // TXTv (high byte is version)
+    static const uint32_t HEADER_VERTEX_SIZE = 4 * sizeof(float);  // x, y, u, v
+    static const uint32_t HEADER_INDEX_SIZE = sizeof(uint16_t);
 
     fwrite(&HEADER_MAGIC, sizeof(HEADER_MAGIC), 1, file);
     fwrite(&HEADER_VERTEX_SIZE, sizeof(HEADER_VERTEX_SIZE), 1, file);
@@ -985,8 +996,28 @@ int main(int argc, char** argv) {
 
             uint32_t vertex_count = 4 * page->typeset_glyph_count;
             fwrite(&vertex_count, sizeof(uint32_t), 1, file);
-            for (uint32_t k = 0; k < vertex_count; ++k) {
-                // TODO write vertex
+            for (uint32_t k = 0; k < page->typeset_glyph_count; ++k) {
+                float todo_uv = 1234.5678f;
+
+                fwrite(&page->typeset_glyphs[k].x0, sizeof(float), 1, file);
+                fwrite(&page->typeset_glyphs[k].y0, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+
+                fwrite(&page->typeset_glyphs[k].x0, sizeof(float), 1, file);
+                fwrite(&page->typeset_glyphs[k].y1, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+
+                fwrite(&page->typeset_glyphs[k].x1, sizeof(float), 1, file);
+                fwrite(&page->typeset_glyphs[k].y1, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+
+                fwrite(&page->typeset_glyphs[k].x1, sizeof(float), 1, file);
+                fwrite(&page->typeset_glyphs[k].y0, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
+                fwrite(&todo_uv, sizeof(float), 1, file);
             }
         }
     }
@@ -996,5 +1027,3 @@ int main(int argc, char** argv) {
     printf("Done\n");
     return 0;
 }
-
-// -----------------------------------------------------------------------------
