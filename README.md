@@ -26,9 +26,7 @@ struct str {
 
 struct TextcFile {
     u8[3] magic = "TXT";
-    u8  version;
-    u32 vertex_size;
-    u32 index_size;
+    u8  version = 0;
     u32 num_strings;
     for num_strings {
         str name;
@@ -71,5 +69,6 @@ void textc_fill_index_buffer(uint16_t* buffer, size_t count) {
     }
 }
 
-// in other words, it's always bunch of quads one after the other
+// in other words it's always bunch of quads one after the other, each glyph
+// is drawn on a quad, and the quads are provided in logical/reading order
 ```

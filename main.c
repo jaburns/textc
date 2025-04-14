@@ -19,6 +19,7 @@
 
 #define ENABLE_DEBUG_OUTPUT 1
 #define ENABLE_DEBUG_GLYPH_BOUNDS 0
+#define MSDFGEN_PX_RANGE 2
 #define CACHE_FILE_NAME ".cache"
 
 // -----------------------------------------------------------------------------
@@ -31,6 +32,8 @@
         raise(SIGTRAP);               \
         exit(1);                      \
     } while (0)
+
+#define Log(msg) printf("textc: %s\n", msg)
 
 // -----------------------------------------------------------------------------
 // memory
@@ -83,10 +86,6 @@ static void arena_resize(Arena* arena, size_t total_size) {
         int32_t result = madvise(arena->head + new_size, remove_size * ARENA_BLOCK_SIZE, MADV_DONTNEED);
         if (result == -1) Panic("madvise failed");
     }
-}
-
-static void arena_align(Arena* arena, size_t alignment) {
-    arena->head = (void*)(((uintptr_t)arena->head + (alignment - 1)) & ~(alignment - 1));
 }
 
 static void* arena_alloc(Arena* arena, size_t size) {
@@ -384,7 +383,7 @@ typedef struct {
     uint32_t count;
 } LoadedFonts;
 
-LoadedFont* find_font_by_family_name(LoadedFonts* loaded_fonts, char* family_name) {
+static LoadedFont* find_font_by_family_name(LoadedFonts* loaded_fonts, char* family_name) {
     for (int32_t i = 0; i < loaded_fonts->count; ++i) {
         if (!strcmp(loaded_fonts->elems[i].family_name, family_name)) {
             return &loaded_fonts->elems[i];
@@ -393,7 +392,7 @@ LoadedFont* find_font_by_family_name(LoadedFonts* loaded_fonts, char* family_nam
     return NULL;
 }
 
-LoadedFont* find_font_by_face(LoadedFonts* loaded_fonts, char* face) {
+static LoadedFont* find_font_by_face(LoadedFonts* loaded_fonts, char* face) {
     for (int32_t i = 0; i < loaded_fonts->count; ++i) {
         if (!strcmp(loaded_fonts->elems[i].face, face)) {
             return &loaded_fonts->elems[i];
@@ -402,7 +401,7 @@ LoadedFont* find_font_by_face(LoadedFonts* loaded_fonts, char* face) {
     return NULL;
 }
 
-LoadedFonts load_fonts(Arena* arena) {
+static LoadedFonts load_fonts(Arena* arena) {
     const char* file;
 
     LoadedFonts ret = {0};
@@ -692,9 +691,10 @@ static AtlasGlyphBitmap* render_glyph_msdf_bitmaps(Arena* arena, ShimRenderer* r
         snprintf(
             command,
             CMD_BUF_SIZE,
-            "tool/msdfgen -font %s.ttf g%u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions %u %u -format bin",
+            "tool/msdfgen -font %s.ttf g%u -pxrange %u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions %u %u -format bin",
             used_glyphs[i].face,
             glyph,
+            MSDFGEN_PX_RANGE,
             ATLAS_GLYPH_BITMAP_SIZE,
             ATLAS_GLYPH_BITMAP_SIZE
         );
@@ -790,7 +790,7 @@ static AtlasGlyphUv* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer
         uint32_t stored_hash;
         FRead(&stored_hash, sizeof(uint32_t), 1, file);
         if (stored_hash == new_hash) {
-            printf("Using cached atlas...\n");
+            Log("using cached atlas...");
             FRead(&used_glyph_count, sizeof(uint32_t), 1, file);
             ret = arena_alloc(arena, sizeof(AtlasGlyphUv) * used_glyph_count);
             FRead(ret, sizeof(AtlasGlyphUv), used_glyph_count, file);
@@ -800,7 +800,7 @@ static AtlasGlyphUv* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer
         fclose(file);
     }
 
-    printf("Baking atlas...\n");
+    Log("baking atlas...");
     ret = bake_used_glyphs_to_atlas(arena, renderer);
 
     file = fopen(CACHE_FILE_NAME, "wb+");
@@ -1128,7 +1128,7 @@ int main(int argc, char** argv) {
 
     InputCsv input = parse_input_files(&base_arena);
     if (input.cached_hash_matched) {
-        printf("No changes to input files, doing nothing\n");
+        Log("no changes to input files, doing nothing");
         return 0;
     }
 
@@ -1146,7 +1146,7 @@ int main(int argc, char** argv) {
     ShimRenderer* renderer = shim_renderer_new(&loaded_fonts);
     ArenaOf(RenderedString) results = arena_create();
 
-    printf("Shaping text...\n");
+    Log("shaping text...");
     for (int32_t i = 0; i < input.strings_count; ++i) {
         RenderedString rendered = render_string_entry(&base_arena, context, renderer, &input, lang_idx, i);
         if (input.strings[i].width > 0) {
@@ -1158,12 +1158,9 @@ int main(int argc, char** argv) {
 
     FILE* file = fopen("bin/strings.txtc", "wb+");
 
-    FWriteValue(uint32_t, 0x00545854, file);         // Filetype bytes: TXTv (high byte is version)
-    FWriteValue(uint32_t, 4 * sizeof(float), file);  // Vertex size: x, y, u, v
-    FWriteValue(uint32_t, sizeof(uint16_t), file);   // Index size
+    FWriteValue(uint32_t, 0x00545854, file);  // Filetype bytes: TXTv (high byte is version)
 
     fwrite(&input.strings_count, sizeof(uint32_t), 1, file);
-
     for (uint32_t i = 0; i < ArenaCountT(RenderedString, &results); ++i) {
         RenderedString* str = ArenaGetT(RenderedString, &results, i);
 
@@ -1216,7 +1213,6 @@ int main(int argc, char** argv) {
     }
 
     fclose(file);
-
-    printf("Done\n");
+    Log("done");
     return 0;
 }
