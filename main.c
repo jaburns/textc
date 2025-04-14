@@ -1,5 +1,4 @@
 // TODO
-// - cache hash of strings.csv
 // - pack atlas properly, selecting correct minimumish size
 
 #include <stdlib.h>
@@ -187,13 +186,19 @@ static char* read_cmd(Arena* arena, char* cmd, uint32_t* out_length) {
     return ret;
 }
 
-static uint32_t hash_djb2(void* data, uint32_t count, uint32_t stride) {
+#define HASH_DJB2_INIT 5381
+
+static void hash_djb2_acc(uint32_t* hash, void* data, size_t count, size_t stride) {
     uint8_t* str = data;
-    uint32_t hash = 5381;
     while (count-- > 0) {
-        hash = (hash << 5) + (hash ^ *str);
+        *hash = (*hash << 5) + (*hash ^ *str);
         str += stride;
     }
+}
+
+static uint32_t hash_djb2(void* data, size_t count, size_t stride) {
+    uint32_t hash = HASH_DJB2_INIT;
+    hash_djb2_acc(&hash, data, count, stride);
     return hash;
 }
 
@@ -225,11 +230,16 @@ typedef struct {
 typedef struct {
     StylesCsvEntry* styles;
     uint32_t styles_count;
+
     StringsCsvEntry* strings;
     uint32_t strings_count;
     uint32_t max_string_length;
+
     char** languages;
     uint32_t language_count;
+
+    uint32_t hash;
+    bool cached_hash_matched;
 } InputCsv;
 
 static void parse_csv(
@@ -325,18 +335,40 @@ static InputCsv parse_input_files(Arena* arena) {
 
     InputCsv ret = {0};
 
+    ret.hash = HASH_DJB2_INIT;
+
     uint32_t styles_length;
     char* styles_contents = read_file(&scratch, "styles.csv", &styles_length);
+    uint32_t strings_length;
+    char* strings_contents = read_file(&scratch, "strings.csv", &strings_length);
+
+    hash_djb2_acc(&ret.hash, styles_contents, styles_length, 1);
+    hash_djb2_acc(&ret.hash, strings_contents, strings_length, 1);
+
+    FILE* file = fopen(CACHE_FILE_NAME, "rb+");
+
+    if (file) {
+        uint32_t old_hash;
+        FRead(&old_hash, sizeof(uint32_t), 1, file);
+        fseek(file, 0, SEEK_SET);
+        FWriteValue(uint32_t, ret.hash, file);
+        fclose(file);
+
+        if (old_hash == ret.hash) {
+            ret.cached_hash_matched = true;
+            goto end;
+        }
+    }
+
     uint32_t max_styles = file_count_lines(styles_contents, styles_length, NULL);
     ret.styles = arena_alloc(arena, max_styles * sizeof(StylesCsvEntry));
     parse_csv(arena, styles_contents, styles_length, &ret, NULL, parse_styles_csv_row);
 
-    uint32_t strings_length;
-    char* strings_contents = read_file(&scratch, "strings.csv", &strings_length);
     uint32_t max_strings = file_count_lines(strings_contents, strings_length, &ret.max_string_length);
     ret.strings = arena_alloc(arena, max_strings * sizeof(StringsCsvEntry));
     parse_csv(arena, strings_contents, strings_length, &ret, parse_strings_csv_header, parse_strings_csv_row);
 
+end:
     arena_destroy(&scratch);
     return ret;
 }
@@ -635,7 +667,7 @@ static int32_t glyph_id_sort(const void* va, const void* vb) {
                            : 0;
 }
 
-static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* renderer) {
+static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* renderer, uint32_t csv_hash) {
     AtlasGlyph* ret = NULL;
 
     uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
@@ -644,6 +676,7 @@ static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* 
 
     FILE* file = fopen(CACHE_FILE_NAME, "rb+");
     if (file) {
+        fseek(file, sizeof(uint32_t), SEEK_SET);  // skip over the csv hash
         uint32_t stored_hash;
         FRead(&stored_hash, sizeof(uint32_t), 1, file);
         if (stored_hash == new_hash) {
@@ -661,6 +694,7 @@ static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* 
     ret = bake_used_glyphs_to_atlas(arena, renderer);
 
     file = fopen(CACHE_FILE_NAME, "wb+");
+    fwrite(&csv_hash, sizeof(uint32_t), 1, file);
     fwrite(&new_hash, sizeof(uint32_t), 1, file);
     fwrite(&used_glyph_count, sizeof(uint32_t), 1, file);
     fwrite(ret, sizeof(AtlasGlyph), used_glyph_count, file);
@@ -983,6 +1017,10 @@ int main(int argc, char** argv) {
     Arena base_arena = arena_create();
 
     InputCsv input = parse_input_files(&base_arena);
+    if (input.cached_hash_matched) {
+        printf("No changes to input files, doing nothing\n");
+        return 0;
+    }
 
     uint32_t lang_idx = 0;
     for (; lang_idx < input.language_count; ++lang_idx) {
@@ -1006,7 +1044,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    AtlasGlyph* glyph_uvs = bake_used_glyphs_to_atlas_cached(&base_arena, renderer);
+    AtlasGlyph* glyph_uvs = bake_used_glyphs_to_atlas_cached(&base_arena, renderer, input.hash);
 
     FILE* file = fopen("bin/strings.txtc", "wb+");
 

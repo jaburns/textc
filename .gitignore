@@ -4,3 +4,4 @@
 /vcpkg/
 /text/bin/
 /text/tool/
+/text/.cache
