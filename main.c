@@ -1,3 +1,7 @@
+// TODO
+// - cache hash of strings.csv
+// - pack atlas properly, selecting correct minimumish size
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -12,14 +16,14 @@
 #include <glib.h>
 #include <pango/pangocairo.h>
 #include <fontconfig/fontconfig.h>
-
 #include "vendor/lodepng.h"
 
 // -----------------------------------------------------------------------------
-// flags
+// config
 
 #define ENABLE_DEBUG_OUTPUT 1
 #define ENABLE_DEBUG_GLYPH_BOUNDS 0
+#define CACHE_FILE_NAME ".cache"
 
 // -----------------------------------------------------------------------------
 
@@ -110,6 +114,15 @@ static void arena_clear(Arena* arena) {
 // -----------------------------------------------------------------------------
 // io utils
 
+#define FRead(ptr, size, nitems, stream) \
+    if (!fread(ptr, size, nitems, stream)) Panic("file read failed")
+
+#define FWriteValue(type, value, stream)         \
+    do {                                         \
+        type val = (value);                      \
+        fwrite(&val, sizeof(type), 1, (stream)); \
+    } while (0)
+
 static char* read_file(Arena* arena, char* filename, uint32_t* out_length) {
     FILE* file = fopen(filename, "r");
     if (file == NULL) {
@@ -121,7 +134,7 @@ static char* read_file(Arena* arena, char* filename, uint32_t* out_length) {
     fseek(file, 0, SEEK_SET);
 
     char* content = arena_alloc(arena, file_size + 1);
-    fread(content, 1, file_size, file);
+    FRead(content, 1, file_size, file);
     content[file_size] = 0;
     fclose(file);
 
@@ -172,6 +185,16 @@ static char* read_cmd(Arena* arena, char* cmd, uint32_t* out_length) {
     *(char*)arena_alloc(arena, 1) = '\0';
 
     return ret;
+}
+
+static uint32_t hash_djb2(void* data, uint32_t count, uint32_t stride) {
+    uint8_t* str = data;
+    uint32_t hash = 5381;
+    while (count-- > 0) {
+        hash = (hash << 5) + (hash ^ *str);
+        str += stride;
+    }
+    return hash;
 }
 
 // -----------------------------------------------------------------------------
@@ -412,23 +435,21 @@ LoadedFonts load_fonts(Arena* arena) {
 
 typedef struct {
     char* face;
+    uint32_t uid;
     uint32_t id;
 } GlyphId;
 
 typedef struct {
     float x0, y0, x1, y1;
-    uint32_t used_glyph_idx;
     uint32_t source_idx;
+    uint32_t glyph_uid;
 } TypesetGlyph;
 
 typedef struct _ShimRenderer {
     PangoRenderer parent_instance;
-
     LoadedFonts* loaded_fonts;
-
     char* cur_face;
     uint32_t cur_source_offset;
-
     ArenaOf(GlyphId) used_glyphs;
     ArenaOf(TypesetGlyph) typeset_glyphs;
 } ShimRenderer;
@@ -438,6 +459,11 @@ typedef struct _ShimRendererClass {
 } ShimRendererClass;
 
 G_DEFINE_TYPE(ShimRenderer, shim_renderer, PANGO_TYPE_RENDERER)
+
+static uint64_t get_glyph_uid(char* face, uint32_t id) {
+    uint32_t face_hash = hash_djb2(face, strnlen(face, 255), 1);
+    return ((uint64_t)face_hash << 32) | ((uint64_t)id);
+}
 
 static void shim_renderer_prepare_run(PangoRenderer* renderer0, PangoLayoutRun* run) {
     ShimRenderer* renderer = (ShimRenderer*)renderer0;
@@ -468,29 +494,30 @@ static void shim_renderer_draw_glyphs(PangoRenderer* renderer0, PangoFont* font,
             double cy = base_y + (double)(gi->geometry.y_offset) / PANGO_SCALE;
 
             uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
-            uint32_t used_glyph_idx = -1;
+            uint32_t used_glyph_uid = -1;
 
             if (gi->glyph & PANGO_GLYPH_UNKNOWN_FLAG) continue;
 
             for (uint32_t i = 0; i < used_glyph_count; ++i) {
                 GlyphId* used = ArenaGetT(GlyphId, &renderer->used_glyphs, i);
                 if (used->id == gi->glyph && !strcmp(used->face, renderer->cur_face)) {
-                    used_glyph_idx = i;
+                    used_glyph_uid = used->uid;
                     goto already_used;
                 }
             }
 
-            used_glyph_idx = used_glyph_count;
+            used_glyph_uid = get_glyph_uid(renderer->cur_face, gi->glyph);
             *ArenaPushT(GlyphId, &renderer->used_glyphs) = (GlyphId){
                 .face = renderer->cur_face,
+                .uid = used_glyph_uid,
                 .id = gi->glyph,
             };
 
         already_used:
 
             *ArenaPushT(TypesetGlyph, &renderer->typeset_glyphs) = (TypesetGlyph){
-                .used_glyph_idx = used_glyph_idx,
                 .source_idx = glyphs->log_clusters[i] + renderer->cur_source_offset,
+                .glyph_uid = used_glyph_uid,
                 .x0 = (float)(cx + (double)ink_extents.x / (double)PANGO_SCALE),
                 .y0 = (float)(cy + (double)ink_extents.y / (double)PANGO_SCALE),
                 .x1 = (float)(cx + (double)ink_extents.x / (double)PANGO_SCALE + (double)ink_extents.width / (double)PANGO_SCALE),
@@ -530,7 +557,6 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
 
     AtlasGlyph* ret = arena_alloc(arena, 0);
 
-    // FILE* atlas_h = fopen("bin/atlas.h", "w");
     uint32_t atlas_dim = 1024;
 
     Arena scratch = arena_create();
@@ -538,10 +564,6 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
 
     int32_t basex = 0;
     int32_t basey = 0;
-
-    // fprintf(atlas_h, "static unsigned int FONT_ATLAS_WIDTH = %u;\n", atlas_dim);
-    // fprintf(atlas_h, "static unsigned int FONT_ATLAS_HEIGHT = %u;\n", atlas_dim);
-    // fprintf(atlas_h, "static unsigned int FONT_ATLAS_INFO[%lu][4] = {\n", ArenaCountT(GlyphId, &renderer->used_glyphs));
 
     GlyphId* used_glyphs = (GlyphId*)renderer->used_glyphs.head;
 
@@ -586,7 +608,6 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
             .u1 = (float)(basex + 2 + ow - 4) / (float)atlas_dim,
             .v1 = (float)(basey + 2 + oh - 4) / (float)atlas_dim,
         };
-        // fprintf(atlas_h, "    { %i, %i, %i, %i },\n", basex + 2, basey + 2, ow - 4, oh - 4);
 
         basex += 100;
         if (basex > 850) {
@@ -595,15 +616,55 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
         }
     }
 
-    // fprintf(atlas_h, "};\n");
-
     unsigned error = lodepng_encode32_file("bin/atlas.png", atlas, atlas_dim, atlas_dim);
     if (error) Panic("Error saving PNG: %s\n", lodepng_error_text(error));
 
-    // fclose(atlas_h);
-
     arena_destroy(&scratch);
 
+    return ret;
+}
+
+static int32_t glyph_id_sort(const void* va, const void* vb) {
+    const GlyphId *a = va, *b = vb;
+
+    int32_t face_delta = strcmp(a->face, b->face);
+    if (face_delta) return face_delta;
+
+    return a->id < b->id   ? -1
+           : a->id > b->id ? 1
+                           : 0;
+}
+
+static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* renderer) {
+    AtlasGlyph* ret = NULL;
+
+    uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
+    qsort(renderer->used_glyphs.head, used_glyph_count, sizeof(GlyphId), glyph_id_sort);
+    uint32_t new_hash = hash_djb2(renderer->used_glyphs.head + offsetof(GlyphId, uid), used_glyph_count, sizeof(GlyphId));
+
+    FILE* file = fopen(CACHE_FILE_NAME, "rb+");
+    if (file) {
+        uint32_t stored_hash;
+        FRead(&stored_hash, sizeof(uint32_t), 1, file);
+        if (stored_hash == new_hash) {
+            printf("Using cached atlas...\n");
+            FRead(&used_glyph_count, sizeof(uint32_t), 1, file);
+            ret = arena_alloc(arena, sizeof(AtlasGlyph) * used_glyph_count);
+            FRead(ret, sizeof(AtlasGlyph), used_glyph_count, file);
+            fclose(file);
+            return ret;
+        }
+        fclose(file);
+    }
+
+    printf("Baking atlas...\n");
+    ret = bake_used_glyphs_to_atlas(arena, renderer);
+
+    file = fopen(CACHE_FILE_NAME, "wb+");
+    fwrite(&new_hash, sizeof(uint32_t), 1, file);
+    fwrite(&used_glyph_count, sizeof(uint32_t), 1, file);
+    fwrite(ret, sizeof(AtlasGlyph), used_glyph_count, file);
+    fclose(file);
     return ret;
 }
 
@@ -693,10 +754,8 @@ static RenderedPage render_page(
         user_tags[i].end_idx = index_map[user_tags[i].end_idx];
     }
 
-    // ---
-
 #if ENABLE_DEBUG_OUTPUT
-    {
+    if (width > 0) {
         cairo_set_source_rgb(cr, 1, 1, 1);
         pango_cairo_show_layout(cr, layout);
 
@@ -937,37 +996,25 @@ int main(int argc, char** argv) {
     PangoContext* context = pango_font_map_create_context(pango_cairo_font_map_new_for_font_type(CAIRO_FONT_TYPE_FT));
     LoadedFonts loaded_fonts = load_fonts(&base_arena);
     ShimRenderer* renderer = shim_renderer_new(&loaded_fonts);
+    ArenaOf(RenderedString) results = arena_create();
 
     printf("Shaping text...\n");
-
-    Arena results = arena_create();
-
     for (int32_t i = 0; i < input.strings_count; ++i) {
-        *(RenderedString*)arena_alloc(&results, sizeof(RenderedString)) =
-            render_string_entry(&base_arena, context, renderer, &input, lang_idx, i);
+        RenderedString rendered = render_string_entry(&base_arena, context, renderer, &input, lang_idx, i);
+        if (input.strings[i].width > 0) {
+            *ArenaPushT(RenderedString, &results) = rendered;
+        }
     }
 
-    printf("Baking atlas...\n");
-    AtlasGlyph* glyph_uvs = bake_used_glyphs_to_atlas(&base_arena, renderer);
-
-    // TODO
-    // - cache atlas, don't bake it if no new glyphs were added or removed by changing the text.
-    // - pack atlas properly, selecting correct minimumish size
-    // end_idx needs to be +1
-    // bold and italic ranges are the same :/
+    AtlasGlyph* glyph_uvs = bake_used_glyphs_to_atlas_cached(&base_arena, renderer);
 
     FILE* file = fopen("bin/strings.txtc", "wb+");
 
-    static const uint32_t HEADER_MAGIC = 0x00545854;  // TXTv (high byte is version)
-    fwrite(&HEADER_MAGIC, sizeof(uint32_t), 1, file);
+    FWriteValue(uint32_t, 0x00545854, file);         // Filetype bytes: TXTv (high byte is version)
+    FWriteValue(uint32_t, 4 * sizeof(float), file);  // Vertex size: x, y, u, v
+    FWriteValue(uint32_t, sizeof(uint16_t), file);   // Index size
 
-    static const uint32_t HEADER_VERTEX_SIZE = 4 * sizeof(float);  // x, y, u, v
-    fwrite(&HEADER_VERTEX_SIZE, sizeof(uint32_t), 1, file);
-
-    static const uint32_t HEADER_INDEX_SIZE = sizeof(uint16_t);
-    fwrite(&HEADER_INDEX_SIZE, sizeof(uint32_t), 1, file);
-
-    fwrite(&input.strings_count, sizeof(input.strings_count), 1, file);
+    fwrite(&input.strings_count, sizeof(uint32_t), 1, file);
 
     for (uint32_t i = 0; i < ArenaCountT(RenderedString, &results); ++i) {
         RenderedString* str = ArenaGetT(RenderedString, &results, i);
@@ -994,11 +1041,21 @@ int main(int argc, char** argv) {
             for (uint32_t k = 0; k < page->typeset_glyph_count; ++k) {
                 TypesetGlyph* glyph = &page->typeset_glyphs[k];
 
-#define X(a, b)                                                             \
-    fwrite(&glyph->x##a, sizeof(float), 1, file);                           \
-    fwrite(&glyph->y##b, sizeof(float), 1, file);                           \
-    fwrite(&glyph_uvs[glyph->used_glyph_idx].u##a, sizeof(float), 1, file); \
-    fwrite(&glyph_uvs[glyph->used_glyph_idx].v##b, sizeof(float), 1, file);
+                uint32_t idx = UINT32_MAX;
+                for (uint32_t j = 0; j < ArenaCountT(GlyphId, &renderer->used_glyphs); ++j) {
+                    GlyphId* gid = ArenaGetT(GlyphId, &renderer->used_glyphs, j);
+                    if (glyph->glyph_uid == gid->uid) {
+                        idx = j;
+                        break;
+                    }
+                }
+                Assert(idx < UINT32_MAX);
+
+#define X(a, b)                                           \
+    fwrite(&glyph->x##a, sizeof(float), 1, file);         \
+    fwrite(&glyph->y##b, sizeof(float), 1, file);         \
+    fwrite(&glyph_uvs[idx].u##a, sizeof(float), 1, file); \
+    fwrite(&glyph_uvs[idx].v##b, sizeof(float), 1, file);
 
                 X(0, 0);
                 X(0, 1);

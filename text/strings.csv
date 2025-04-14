@@ -1,3 +1,5 @@
 KEY,WIDTH,HEIGHT,EN,AR
+_,0,0,0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ,0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 welcome,1000,500,"[#-title]Hell'o, [#b]wor[#i]ld![#/][#/] Literal [[#tag].
 A [#-script]""second""[#-] line[#.]Next [#wiggle]page[#/]!",مرحبا 32 بالعالم
+goodbye,500,200,[#-title]Bye.,[#-title]Bye2.

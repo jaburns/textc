@@ -3,7 +3,6 @@ set -e
 
 mkdir -p text/tool
 mkdir -p text/bin
-mkdir -p output
 
 clang -Wall -Werror -Wno-unused-variable -Wno-unused-function \
     $(pkg-config --cflags --libs pango pangocairo fontconfig) \
