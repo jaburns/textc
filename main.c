@@ -1,6 +1,3 @@
-// TODO
-// - pack atlas properly, selecting correct minimumish size
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -579,32 +576,112 @@ static ShimRenderer* shim_renderer_new(LoadedFonts* loaded_fonts) {
 // -----------------------------------------------------------------------------
 // atlas generation
 
+#define ATLAS_GLYPH_BITMAP_SIZE 128
+
+typedef struct {
+    uint8_t* bytes;
+    int32_t xmin, xmax;
+    int32_t ymin, ymax;
+} AtlasGlyphBitmap;
+
 typedef struct {
     float u0, v0;
     float u1, v1;
-} AtlasGlyph;
+} AtlasGlyphUv;
 
-static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* renderer) {
-    static char command[1024];
+typedef struct {
+    int32_t x, y;
+} AtlasGlyphPosition;
 
-    AtlasGlyph* ret = arena_alloc(arena, 0);
+typedef struct {
+    uint32_t index;
+    int32_t height;
+} AtlasGlyphHeight;
 
-    uint32_t atlas_dim = 1024;
+static int32_t sort_cmp_atlas_glyph_height(const void* va, const void* vb) {
+    const AtlasGlyphHeight *a = (AtlasGlyphHeight*)va, *b = (AtlasGlyphHeight*)vb;
+    return b->height - a->height;
+}
 
+static uint32_t pack_atlas_glyphs(AtlasGlyphPosition* out_positions, AtlasGlyphBitmap* glyphs, size_t glyph_count) {
     Arena scratch = arena_create();
-    uint8_t* atlas = arena_alloc(&scratch, atlas_dim * atlas_dim * 4);
 
-    int32_t basex = 0;
-    int32_t basey = 0;
+    AtlasGlyphHeight* order = arena_alloc(&scratch, glyph_count * sizeof(AtlasGlyphHeight));
+    AtlasGlyphPosition* sorted_pos = arena_alloc(&scratch, glyph_count * sizeof(AtlasGlyphPosition));
 
+    int32_t max_dim = 0;
+    for (int32_t i = 0; i < glyph_count; i++) {
+        int32_t width = glyphs[i].xmax - glyphs[i].xmin;
+        int32_t height = glyphs[i].ymax - glyphs[i].ymin;
+        order[i].index = i;
+        order[i].height = height;
+        if (width > max_dim) max_dim = width;
+        if (height > max_dim) max_dim = height;
+    }
+
+    qsort(order, glyph_count, sizeof(AtlasGlyphHeight), sort_cmp_atlas_glyph_height);
+
+    int32_t size = 1;
+    while (size < max_dim) size *= 2;
+
+    {
+    retry_pack: {}
+        int32_t cur_x = 0, cur_y = 0;
+        int32_t row_height = 0;
+        for (uint32_t i = 0; i < glyph_count; i++) {
+            uint32_t idx = order[i].index;
+            int32_t width = glyphs[idx].xmax - glyphs[idx].xmin;
+            int32_t height = glyphs[idx].ymax - glyphs[idx].ymin;
+
+            if (cur_x + width > size) {
+                cur_x = 0;
+                cur_y += row_height;
+                row_height = 0;
+            }
+            if (cur_y + height > size) {
+                size *= 2;
+                goto retry_pack;
+            }
+            sorted_pos[i].x = cur_x;
+            sorted_pos[i].y = cur_y;
+            cur_x += width;
+            if (height > row_height) {
+                row_height = height;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < glyph_count; i++) {
+        out_positions[order[i].index] = sorted_pos[i];
+    }
+
+    arena_destroy(&scratch);
+
+    return size;
+}
+
+static AtlasGlyphBitmap* render_glyph_msdf_bitmaps(Arena* arena, ShimRenderer* renderer) {
+    static const size_t CMD_BUF_SIZE = 1024;
+    static char command[CMD_BUF_SIZE];
+
+    uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
     GlyphId* used_glyphs = (GlyphId*)renderer->used_glyphs.head;
 
-    for (int32_t i = 0; i < ArenaCountT(GlyphId, &renderer->used_glyphs); ++i) {
+    AtlasGlyphBitmap* ret = arena_alloc(arena, used_glyph_count * sizeof(AtlasGlyphBitmap));
+
+    for (int32_t i = 0; i < used_glyph_count; ++i) {
         uint32_t glyph = used_glyphs[i].id;
 
         uint32_t size;
-        sprintf(command, "tool/msdfgen metrics -font %s.ttf g%u -emnormalize", used_glyphs[i].face, glyph);
-        char* msdfgen_metrics = read_cmd(&scratch, command, &size);
+        snprintf(
+            command,
+            CMD_BUF_SIZE,
+            "tool/msdfgen metrics -font %s.ttf g%u -emnormalize",
+            used_glyphs[i].face,
+            glyph
+        );
+
+        char* msdfgen_metrics = read_cmd(arena, command, &size);
         float msdf_x0 = 0.f, msdf_y0 = 0.f, msdf_x1 = 0.f, msdf_y1 = 0.f;
         Assert(4 == sscanf(msdfgen_metrics, "bounds = %f , %f , %f , %f", &msdf_x0, &msdf_y0, &msdf_x1, &msdf_y1));
         int32_t x0 = (int32_t)floorf(64.f * msdf_x0);
@@ -612,18 +689,57 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
         int32_t y0 = (int32_t)floorf(64.f * msdf_y0);
         int32_t y1 = (int32_t)ceilf(64.f * msdf_y1);
 
-        sprintf(command, "tool/msdfgen -font %s.ttf g%u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions 128 128 -format bin", used_glyphs[i].face, glyph);
-        system(command);
-        unsigned char* bytes = (uint8_t*)read_file(&scratch, "output.bin", &size);
-        remove("output.bin");
-        Assert(size == 128 * 128 * 3);
+        snprintf(
+            command,
+            CMD_BUF_SIZE,
+            "tool/msdfgen -font %s.ttf g%u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions %u %u -format bin",
+            used_glyphs[i].face,
+            glyph,
+            ATLAS_GLYPH_BITMAP_SIZE,
+            ATLAS_GLYPH_BITMAP_SIZE
+        );
 
-        int32_t ow, oh;
+        system(command);
+        ret[i].bytes = (uint8_t*)read_file(arena, "output.bin", &size);
+        remove("output.bin");
+        Assert(size == ATLAS_GLYPH_BITMAP_SIZE * ATLAS_GLYPH_BITMAP_SIZE * 3);
+
+        ret[i].xmin = 32 + x0 - 2;
+        ret[i].xmax = 32 + x1 + 2;
+        ret[i].ymin = 32 + y0 - 2;
+        ret[i].ymax = 32 + y1 + 2;
+    }
+
+    return ret;
+}
+
+static AtlasGlyphUv* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* renderer) {
+    uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
+
+    AtlasGlyphUv* ret = arena_alloc(arena, used_glyph_count * sizeof(AtlasGlyphUv));
+    Arena scratch = arena_create();
+
+    AtlasGlyphBitmap* bitmaps = render_glyph_msdf_bitmaps(&scratch, renderer);
+
+    AtlasGlyphPosition* packed_pos = arena_alloc(&scratch, used_glyph_count * sizeof(AtlasGlyphPosition));
+    uint32_t atlas_dim = pack_atlas_glyphs(packed_pos, bitmaps, used_glyph_count);
+
+    uint8_t* atlas = arena_alloc(&scratch, atlas_dim * atlas_dim * 4);
+
+    for (int32_t i = 0; i < used_glyph_count; ++i) {
+        AtlasGlyphBitmap bmp = bitmaps[i];
+
+        int32_t basex = packed_pos[i].x;
+        int32_t basey = packed_pos[i].y;
+
+        int32_t ow = bmp.xmax - bmp.xmin;
+        int32_t oh = bmp.ymax - bmp.ymin;
+
         int32_t oy = basey;
-        for (int32_t y = 32 + y1 + 1; y >= 32 + y0 - 2; y--, oy++) {
+        for (int32_t y = bmp.ymax - 1; y >= bmp.ymin; y--, oy++) {
             int32_t ox = basex;
-            for (int32_t x = 32 + x0 - 2; x < 32 + x1 + 2; x++, ox++) {
-                unsigned char* src_pixel = bytes + (y * 128 + x) * 3;
+            for (int32_t x = bmp.xmin; x < bmp.xmax; x++, ox++) {
+                unsigned char* src_pixel = bmp.bytes + (y * ATLAS_GLYPH_BITMAP_SIZE + x) * 3;
                 unsigned char* dst_pixel = atlas + (oy * atlas_dim + ox) * 4;
                 dst_pixel[0] = src_pixel[0];
                 dst_pixel[1] = src_pixel[1];
@@ -634,18 +750,12 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
         }
         oh = oy - basey;
 
-        *ArenaPushT(AtlasGlyph, arena) = (AtlasGlyph){
+        ret[i] = (AtlasGlyphUv){
             .u0 = (float)(basex + 2) / (float)atlas_dim,
             .v0 = (float)(basey + 2) / (float)atlas_dim,
             .u1 = (float)(basex + 2 + ow - 4) / (float)atlas_dim,
             .v1 = (float)(basey + 2 + oh - 4) / (float)atlas_dim,
         };
-
-        basex += 100;
-        if (basex > 850) {
-            basex = 0;
-            basey += 100;
-        }
     }
 
     unsigned error = lodepng_encode32_file("bin/atlas.png", atlas, atlas_dim, atlas_dim);
@@ -656,7 +766,7 @@ static AtlasGlyph* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rendere
     return ret;
 }
 
-static int32_t glyph_id_sort(const void* va, const void* vb) {
+static int32_t sort_cmp_glyph_id(const void* va, const void* vb) {
     const GlyphId *a = va, *b = vb;
 
     int32_t face_delta = strcmp(a->face, b->face);
@@ -667,11 +777,11 @@ static int32_t glyph_id_sort(const void* va, const void* vb) {
                            : 0;
 }
 
-static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* renderer, uint32_t csv_hash) {
-    AtlasGlyph* ret = NULL;
+static AtlasGlyphUv* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* renderer, uint32_t csv_hash) {
+    AtlasGlyphUv* ret = NULL;
 
     uint32_t used_glyph_count = ArenaCountT(GlyphId, &renderer->used_glyphs);
-    qsort(renderer->used_glyphs.head, used_glyph_count, sizeof(GlyphId), glyph_id_sort);
+    qsort(renderer->used_glyphs.head, used_glyph_count, sizeof(GlyphId), sort_cmp_glyph_id);
     uint32_t new_hash = hash_djb2(renderer->used_glyphs.head + offsetof(GlyphId, uid), used_glyph_count, sizeof(GlyphId));
 
     FILE* file = fopen(CACHE_FILE_NAME, "rb+");
@@ -682,8 +792,8 @@ static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* 
         if (stored_hash == new_hash) {
             printf("Using cached atlas...\n");
             FRead(&used_glyph_count, sizeof(uint32_t), 1, file);
-            ret = arena_alloc(arena, sizeof(AtlasGlyph) * used_glyph_count);
-            FRead(ret, sizeof(AtlasGlyph), used_glyph_count, file);
+            ret = arena_alloc(arena, sizeof(AtlasGlyphUv) * used_glyph_count);
+            FRead(ret, sizeof(AtlasGlyphUv), used_glyph_count, file);
             fclose(file);
             return ret;
         }
@@ -697,7 +807,7 @@ static AtlasGlyph* bake_used_glyphs_to_atlas_cached(Arena* arena, ShimRenderer* 
     fwrite(&csv_hash, sizeof(uint32_t), 1, file);
     fwrite(&new_hash, sizeof(uint32_t), 1, file);
     fwrite(&used_glyph_count, sizeof(uint32_t), 1, file);
-    fwrite(ret, sizeof(AtlasGlyph), used_glyph_count, file);
+    fwrite(ret, sizeof(AtlasGlyphUv), used_glyph_count, file);
     fclose(file);
     return ret;
 }
@@ -724,7 +834,7 @@ typedef struct {
     RenderedPage* pages;
 } RenderedString;
 
-static int32_t typeset_glyph_sort_ascending_source_idx(const void* va, const void* vb) {
+static int32_t sort_cmp_glyph_source_idx(const void* va, const void* vb) {
     const TypesetGlyph *a = va, *b = vb;
     return a->source_idx < b->source_idx   ? -1
            : a->source_idx > b->source_idx ? 1
@@ -764,28 +874,28 @@ static RenderedPage render_page(
     uint32_t glyph_count = ArenaCountT(TypesetGlyph, &renderer->typeset_glyphs);
 
     // sort glyphs into order the appear in the text instead of being always left-to-right
-
-    qsort(glyphs, glyph_count, sizeof(TypesetGlyph), typeset_glyph_sort_ascending_source_idx);
+    qsort(glyphs, glyph_count, sizeof(TypesetGlyph), sort_cmp_glyph_source_idx);
 
     // convert source string indices in user tags to glyph array indices
+    {
+        uint32_t* index_map = arena_alloc(&scratch, sizeof(uint32_t) * contents_len);
+        memset(index_map, 0xFF, sizeof(uint32_t) * contents_len);
 
-    uint32_t* index_map = arena_alloc(&scratch, sizeof(uint32_t) * contents_len);
-    memset(index_map, 0xFF, sizeof(uint32_t) * contents_len);
-
-    for (uint32_t i = 0; i < glyph_count; ++i) {
-        index_map[glyphs[i].source_idx] = i;
-    }
-    uint32_t prev = 0;
-    for (uint32_t i = 0; i < contents_len; ++i) {
-        if (index_map[i] == UINT32_MAX) {
-            index_map[i] = prev;
-        } else {
-            prev = index_map[i];
+        for (uint32_t i = 0; i < glyph_count; ++i) {
+            index_map[glyphs[i].source_idx] = i;
         }
-    }
-    for (uint32_t i = 0; i < user_tag_count; ++i) {
-        user_tags[i].start_idx = index_map[user_tags[i].start_idx];
-        user_tags[i].end_idx = index_map[user_tags[i].end_idx];
+        uint32_t prev = 0;
+        for (uint32_t i = 0; i < contents_len; ++i) {
+            if (index_map[i] == UINT32_MAX) {
+                index_map[i] = prev;
+            } else {
+                prev = index_map[i];
+            }
+        }
+        for (uint32_t i = 0; i < user_tag_count; ++i) {
+            user_tags[i].start_idx = index_map[user_tags[i].start_idx];
+            user_tags[i].end_idx = index_map[user_tags[i].end_idx];
+        }
     }
 
 #if ENABLE_DEBUG_OUTPUT
@@ -1044,7 +1154,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    AtlasGlyph* glyph_uvs = bake_used_glyphs_to_atlas_cached(&base_arena, renderer, input.hash);
+    AtlasGlyphUv* glyph_uvs = bake_used_glyphs_to_atlas_cached(&base_arena, renderer, input.hash);
 
     FILE* file = fopen("bin/strings.txtc", "wb+");
 
