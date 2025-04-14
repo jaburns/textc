@@ -1,3 +1,19 @@
+// -----------------------------------------------------------------------------
+// textc - offline text mesh compilation tool
+// Copyright (c) 2025 Jeremy Burns
+// -----------------------------------------------------------------------------
+// ISSUES:
+//  - The glyph boundaries computed by pango are not an exact match for the
+//    the ones msdfden generates. It seems like the pango boundaries map to the
+//    rendered bounds of the glyphs, while the msdfgen ones are read from the
+//    font data. This causes a slight mismatch between the results from rendering
+//    the generated meshes data vs the example outputs from pango. A possible
+//    solution would be to actually fit a rect to the SDF data instead of taking
+//    the bounds data from msdfgen at face value, and use that for the uv data.
+//  - The bounds coming in from msdfgen are snapped to the nearest pixel. This
+//    should be handled when implementing the fix mentioned above.
+// -----------------------------------------------------------------------------
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -20,6 +36,7 @@
 #define ENABLE_DEBUG_OUTPUT 1
 #define ENABLE_DEBUG_GLYPH_BOUNDS 0
 #define MSDFGEN_PX_RANGE 2
+#define GLYPH_PADDING 2
 #define CACHE_FILE_NAME ".cache"
 
 // -----------------------------------------------------------------------------
@@ -579,7 +596,7 @@ static ShimRenderer* shim_renderer_new(LoadedFonts* loaded_fonts) {
 
 typedef struct {
     uint8_t* bytes;
-    int32_t xmin, xmax;
+    int32_t xmin, xmax;  // min inclusive, max exclusive
     int32_t ymin, ymax;
 } AtlasGlyphBitmap;
 
@@ -691,7 +708,7 @@ static AtlasGlyphBitmap* render_glyph_msdf_bitmaps(Arena* arena, ShimRenderer* r
         snprintf(
             command,
             CMD_BUF_SIZE,
-            "tool/msdfgen -font %s.ttf g%u -pxrange %u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions %u %u -format bin",
+            "tool/msdfgen mtsdf -font %s.ttf g%u -pxrange %u -emnormalize -translate 0.5 0.5 -scale 64 -dimensions %u %u -format bin",
             used_glyphs[i].face,
             glyph,
             MSDFGEN_PX_RANGE,
@@ -702,12 +719,12 @@ static AtlasGlyphBitmap* render_glyph_msdf_bitmaps(Arena* arena, ShimRenderer* r
         system(command);
         ret[i].bytes = (uint8_t*)read_file(arena, "output.bin", &size);
         remove("output.bin");
-        Assert(size == ATLAS_GLYPH_BITMAP_SIZE * ATLAS_GLYPH_BITMAP_SIZE * 3);
+        Assert(size == ATLAS_GLYPH_BITMAP_SIZE * ATLAS_GLYPH_BITMAP_SIZE * 4);
 
-        ret[i].xmin = 32 + x0 - 2;
-        ret[i].xmax = 32 + x1 + 2;
-        ret[i].ymin = 32 + y0 - 2;
-        ret[i].ymax = 32 + y1 + 2;
+        ret[i].xmin = 32 + x0 - GLYPH_PADDING;
+        ret[i].xmax = 32 + x1 + GLYPH_PADDING;
+        ret[i].ymin = 32 + y0 - GLYPH_PADDING;
+        ret[i].ymax = 32 + y1 + GLYPH_PADDING;
     }
 
     return ret;
@@ -737,24 +754,16 @@ static AtlasGlyphUv* bake_used_glyphs_to_atlas(Arena* arena, ShimRenderer* rende
 
         int32_t oy = basey;
         for (int32_t y = bmp.ymax - 1; y >= bmp.ymin; y--, oy++) {
-            int32_t ox = basex;
-            for (int32_t x = bmp.xmin; x < bmp.xmax; x++, ox++) {
-                unsigned char* src_pixel = bmp.bytes + (y * ATLAS_GLYPH_BITMAP_SIZE + x) * 3;
-                unsigned char* dst_pixel = atlas + (oy * atlas_dim + ox) * 4;
-                dst_pixel[0] = src_pixel[0];
-                dst_pixel[1] = src_pixel[1];
-                dst_pixel[2] = src_pixel[2];
-                dst_pixel[3] = 0xff;
-            }
-            ow = ox - basex;
+            unsigned char* src_pixels = bmp.bytes + (y * ATLAS_GLYPH_BITMAP_SIZE + bmp.xmin) * 4;
+            unsigned char* dst_pixels = atlas + (oy * atlas_dim + basex) * 4;
+            memcpy(dst_pixels, src_pixels, ow * 4);
         }
-        oh = oy - basey;
 
         ret[i] = (AtlasGlyphUv){
-            .u0 = (float)(basex + 2) / (float)atlas_dim,
-            .v0 = (float)(basey + 2) / (float)atlas_dim,
-            .u1 = (float)(basex + 2 + ow - 4) / (float)atlas_dim,
-            .v1 = (float)(basey + 2 + oh - 4) / (float)atlas_dim,
+            .u0 = (float)(basex + GLYPH_PADDING) / (float)atlas_dim,
+            .v0 = (float)(basey + GLYPH_PADDING) / (float)atlas_dim,
+            .u1 = (float)(basex + GLYPH_PADDING + ow - 4) / (float)atlas_dim,
+            .v1 = (float)(basey + GLYPH_PADDING + oh - 4) / (float)atlas_dim,
         };
     }
 
@@ -873,7 +882,7 @@ static RenderedPage render_page(
     TypesetGlyph* glyphs = (TypesetGlyph*)renderer->typeset_glyphs.head;
     uint32_t glyph_count = ArenaCountT(TypesetGlyph, &renderer->typeset_glyphs);
 
-    // sort glyphs into order the appear in the text instead of being always left-to-right
+    // sort glyphs into logical order instead of being always left-to-right
     qsort(glyphs, glyph_count, sizeof(TypesetGlyph), sort_cmp_glyph_source_idx);
 
     // convert source string indices in user tags to glyph array indices
@@ -1158,7 +1167,7 @@ int main(int argc, char** argv) {
 
     FILE* file = fopen("bin/strings.txtc", "wb+");
 
-    FWriteValue(uint32_t, 0x00545854, file);  // Filetype bytes: TXTv (high byte is version)
+    FWriteValue(uint32_t, 0x00545854, file);  // filetype bytes: TXTv (high byte is version)
 
     fwrite(&input.strings_count, sizeof(uint32_t), 1, file);
     for (uint32_t i = 0; i < ArenaCountT(RenderedString, &results); ++i) {
