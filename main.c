@@ -3,15 +3,15 @@
 // Copyright (c) 2025 Jeremy Burns
 // -----------------------------------------------------------------------------
 // ISSUES:
+//  - The bounds coming in from msdfgen are snapped to the nearest pixel when
+//    computing the uvs, but there's no fundamental reason they have to be.
 //  - The glyph boundaries computed by pango are not an exact match for the
 //    the ones msdfden generates. It seems like the pango boundaries map to the
-//    rendered bounds of the glyphs, while the msdfgen ones are read from the
-//    font data. This causes a slight mismatch between the results from rendering
-//    the generated meshes data vs the example outputs from pango. A possible
-//    solution would be to actually fit a rect to the SDF data instead of taking
-//    the bounds data from msdfgen at face value, and use that for the uv data.
-//  - The bounds coming in from msdfgen are snapped to the nearest pixel. This
-//    should be handled when implementing the fix mentioned above.
+//    rendered bounds of the glyphs after hinting/aa/etc, while the msdfgen ones
+//    are read directly from the glyph shapes. This causes a slight mismatch
+//    between the results from rendering the generated meshes data vs the
+//    example outputs from pango. In practice it basically doesn't matter, but
+//    if you really squint at the pixels the results aren't totally correct.
 // -----------------------------------------------------------------------------
 
 #include <stdlib.h>
@@ -929,8 +929,8 @@ static RenderedPage render_page(
         }
 
 #if ENABLE_DEBUG_GLYPH_BOUNDS
-        for (int32_t i = 0; i < renderer->typeset_glyph_count; ++i) {
-            TypesetGlyph* glyph = &renderer->typeset_glyphs[i];
+        for (int32_t i = 0; i < ArenaCountT(TypesetGlyph, &renderer->typeset_glyphs); ++i) {
+            TypesetGlyph* glyph = ArenaGetT(TypesetGlyph, &renderer->typeset_glyphs, i);
 
             float fx0 = floorf(glyph->x0);
             float fx1 = floorf(glyph->x1);
@@ -944,7 +944,7 @@ static RenderedPage render_page(
 
             for (int32_t y = miny; y <= maxy; ++y) {
                 for (int32_t x = minx; x <= maxx; ++x) {
-                    uint8_t* dst_pixel = rgba + (y * width + x) * 4;
+                    uint8_t* dst_pixel = png_data + (y * width + x) * 4;
                     dst_pixel[0] = MAX(dst_pixel[0], 0x7f);
                     dst_pixel[1] = MAX(dst_pixel[1], 0x7f);
                     dst_pixel[2] = MAX(dst_pixel[2], 0x7f);
