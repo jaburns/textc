@@ -956,7 +956,7 @@ static RenderedPage render_page(
 
         snprintf(filename_buffer, 256, "bin/%s.%u.png", strings_table_key, page_number);
         unsigned error = lodepng_encode32_file(filename_buffer, png_data, width, height);
-        if (error) Panic("Error saving PNG: %s\n", lodepng_error_text(error));
+        if (error) Panic("error saving PNG: %s\n", lodepng_error_text(error));
     }
 #endif  // ENABLE_DEBUG_OUTPUT
 
@@ -1137,7 +1137,6 @@ int main(int argc, char** argv) {
 
     InputCsv input = parse_input_files(&base_arena);
     if (input.cached_hash_matched) {
-        Log("no changes to input files, doing nothing");
         return 0;
     }
 
@@ -1146,7 +1145,7 @@ int main(int argc, char** argv) {
         if (!strcmp(input.languages[lang_idx], argv[1])) break;
     }
     if (lang_idx == input.language_count) {
-        fprintf(stderr, "Language key not present strings.csv: '%s'", argv[1]);
+        fprintf(stderr, "language key not present strings.csv: '%s'", argv[1]);
         return 1;
     }
 
